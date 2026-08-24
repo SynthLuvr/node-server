@@ -285,6 +285,10 @@ app.use(
 )
 ```
 
+### Conditional Requests
+
+`serveStatic` sets the `Last-Modified` header on responses. For `GET` and `HEAD` requests carrying an `If-Modified-Since` header, it responds with `304 Not Modified` when the file has not been modified since that date, per [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#name-if-modified-since). An `If-Modified-Since` header is ignored when `If-None-Match` is present, as the latter takes precedence.
+
 ## Send File Helper
 
 While `serveStatic` serves files based on the request path, the `sendFile` helper serves the file at the path you specify. It is useful when you want to determine the file to serve dynamically, like `res.sendFile()` of Express. It sets the same headers (e.g. `Content-Type`, `Content-Length`, `Last-Modified`) and supports the same features (range requests, HEAD/OPTIONS requests, precompressed files) as `serveStatic`.
