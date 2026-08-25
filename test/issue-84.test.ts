@@ -1,39 +1,15 @@
 /**
  * Reproduction test for issue #84:
- * https://github.com/honojs/node-server/issues/84
+ * https://github.com/honojs/node-server/issues/84 — 500 responses for every
+ * request with a body when a platform layer consumes the IncomingMessage
+ * before the adapter runs, e.g. `@vercel/node` helpers (NODEJS_HELPERS=1, the
+ * default in `vercel dev`) or the Next.js Pages API body parser.
  *
- * "`500` responses when including `body` payload in any request using
- * `@hono/node-server/vercel`"
- *
- * When `@hono/node-server` runs behind a platform layer that reads the
- * IncomingMessage body *before* the adapter gets it — e.g. `@vercel/node`
- * helpers (`vercel dev`, NODEJS_HELPERS enabled by default) or the Next.js
- * Pages API body parser — every request that includes a payload silently
- * fails with a `500` response.
- *
- * The old `@hono/node-server/vercel` adapter (v1.x) was simply
- * `getRequestListener(app.fetch)`, so this test drives that same listener
- * behind a faithful re-implementation of `@vercel/node`'s `addHelpers()`
- * (vercel/vercel `packages/node/src/serverless-functions/helpers.ts`):
- *
- *   - `readBody()` consumes the IncomingMessage stream completely
- *     (making it "disturbed": `readableDidRead === true`), then
- *   - `restoreBody()` rebinds `req.read`/`req.on('data'|'end')` to a
- *     PassThrough that replays the buffered body.
- *
- * The reported behavior (v1.2.0) was `new Request()` throwing
- * "TypeError: Response body object should not be disturbed or locked".
- * On the current implementation the body reads are what fail:
- *
- *   - `c.req.json()` / `.text()` / `.arrayBuffer()` reject with
- *     `TypeError: Body is unusable` (`readBodyDirect()` refuses the request
- *     because `incoming.readableDidRead` is true) => Hono returns `500`.
- *   - `c.req.body` (the wrapped stream) resolves with an *empty* body —
- *     the payload is silently dropped.
- *
- * Expected (bug-free) behavior: the adapter should still deliver the
- * request body that the platform layer consumed and kept available, so the
- * reporter's echo app responds `200` with the original payload.
+ * The tests drive `getRequestListener` behind a re-implementation of the
+ * relevant part of `@vercel/node`'s `addHelpers()`
+ * (vercel/vercel packages/node/src/serverless-functions/helpers.ts):
+ * `readBody()` consumes the stream completely, then `restoreBody()` rebinds
+ * `req.read`/`req.on('data'|'end')` to a PassThrough that replays the body.
  */
 import { Hono } from 'hono'
 import { once } from 'node:events'
@@ -42,11 +18,6 @@ import type { IncomingMessage, Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { PassThrough } from 'node:stream'
 import { getRequestListener } from '../src/listener'
-
-// ---------------------------------------------------------------------------
-// Re-implementation of @vercel/node's addHelpers() body handling, see
-// vercel/vercel packages/node/src/serverless-functions/helpers.ts
-// ---------------------------------------------------------------------------
 
 /**
  * Rebinds `read()` and `data`/`end` event handlers of `req` to a PassThrough
@@ -66,8 +37,7 @@ const restoreBody = (req: IncomingMessage, body: Buffer): void => {
 }
 
 /**
- * Consumes the request body like `readBody()` in @vercel/node's `addHelpers()`
- * (NODEJS_HELPERS enabled — the default in `vercel dev` and deployments).
+ * Consumes the request body like `readBody()` in @vercel/node's `addHelpers()`.
  */
 const addHelpersLikeVercel = async (req: IncomingMessage): Promise<void> => {
   const chunks: Buffer[] = []
@@ -77,26 +47,29 @@ const addHelpersLikeVercel = async (req: IncomingMessage): Promise<void> => {
   restoreBody(req, Buffer.concat(chunks))
 }
 
-// ---------------------------------------------------------------------------
 // The reporter's app (https://github.com/alexiglesias93/hono-vercel-bug)
-// ---------------------------------------------------------------------------
-
 const app = new Hono()
 app.get('/hello', (c) => c.body('Hello from Hono!'))
 app.post('/echo-json', async (c) => c.json(await c.req.json()))
 app.post('/echo-stream', async (c) => {
-  // consume the raw body stream, then echo what was received
-  const reader = c.req.raw.body!.getReader()
   const chunks: Uint8Array[] = []
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) {
-      break
-    }
-    chunks.push(value)
+  for await (const chunk of c.req.raw.body!) {
+    chunks.push(chunk)
   }
   const received = Buffer.concat(chunks)
   return c.json({ length: received.length, text: received.toString('utf8') })
+})
+// Handlers that never touch the body must still complete promptly.
+app.post('/ignore-body', (c) => c.body('ok'))
+// Standard double-read semantics must be preserved after the replay recovery.
+app.post('/double-read', async (c) => {
+  await c.req.raw.body?.cancel()
+  try {
+    await c.req.text()
+    return c.text('no-error')
+  } catch {
+    return c.text('rejected')
+  }
 })
 
 const payload = JSON.stringify({ hello: 'world', from: 'issue-84' })
@@ -131,7 +104,7 @@ describe('issue #84 — requests with a body payload behind a platform that pre-
   })
 
   afterAll(async () => {
-    server.closeAllConnections?.()
+    server.closeAllConnections()
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 
@@ -147,7 +120,6 @@ describe('issue #84 — requests with a body payload behind a platform that pre-
       headers: { 'content-type': 'application/json' },
       body: payload,
     })
-    // The bug: "Hono silently fails and just returns a 500 response"
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ hello: 'world', from: 'issue-84' })
   })
@@ -159,8 +131,26 @@ describe('issue #84 — requests with a body payload behind a platform that pre-
       body: payload,
     })
     expect(res.status).toBe(200)
-    // The bug: the wrapped stream resolves empty, silently dropping the payload
     expect(await res.json()).toEqual({ length: payload.length, text: payload })
+  })
+
+  it('POST whose handler never reads the body should respond promptly (no hang)', async () => {
+    const res = await fetch(`${baseUrl}/ignore-body`, {
+      method: 'POST',
+      body: payload,
+      headers: { 'content-type': 'application/json' },
+    })
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe('ok')
+  })
+
+  it('double body read should still be rejected with standard semantics', async () => {
+    const res = await fetch(`${baseUrl}/double-read`, {
+      method: 'POST',
+      body: payload,
+    })
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe('rejected')
   })
 })
 
@@ -174,7 +164,7 @@ describe('control — same app without platform body consumption (NODEJS_HELPERS
   })
 
   afterAll(async () => {
-    server.closeAllConnections?.()
+    server.closeAllConnections()
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 

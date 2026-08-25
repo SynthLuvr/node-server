@@ -59,10 +59,54 @@ const isByteExactEncoding = (encoding: BufferEncoding | null): boolean =>
 
 const bodyBufferedBeforeDisconnectKey = Symbol('bodyBufferedBeforeDisconnect')
 const bodyBufferedLengthBeforeDisconnectKey = Symbol('bodyBufferedLengthBeforeDisconnect')
+const bodyBufferFromReboundKey = Symbol('bodyBufferFromRebound')
 
 type IncomingWithBodyRecovery = IncomingMessage & {
   [bodyBufferedBeforeDisconnectKey]?: Buffer | Error
   [bodyBufferedLengthBeforeDisconnectKey]?: number
+  [bodyBufferFromReboundKey]?: Promise<Buffer>
+}
+
+// Some platforms consume the IncomingMessage before the application runs and
+// rebind `read`/`on('data'|'end')` to a PassThrough that replays the buffered
+// body — e.g. @vercel/node's helpers with NODEJS_HELPERS enabled (issue #84).
+// Pristine IncomingMessages have `on`/`read` on their prototype, so
+// own-property `on`/`read` on a disturbed stream marks the replay surface.
+const hasReboundBodySurface = (incoming: IncomingMessage | Http2ServerRequest): boolean =>
+  incoming.readableDidRead &&
+  (Object.prototype.hasOwnProperty.call(incoming, 'on') ||
+    Object.prototype.hasOwnProperty.call(incoming, 'read'))
+
+// The promise is cached on the incoming so every read path observes the same outcome.
+const readBodyFromReboundSurface = (
+  incoming: IncomingMessage | Http2ServerRequest
+): Promise<Buffer> => {
+  const incomingWithRecovery = incoming as IncomingWithBodyRecovery
+  return (incomingWithRecovery[bodyBufferFromReboundKey] ??= new Promise<Buffer>(
+    (resolve, reject) => {
+      const chunks: Buffer[] = []
+      const onData = (chunk: Buffer | string) =>
+        chunks.push(toBufferChunk(chunk, incoming.readableEncoding))
+      const onEnd = () => {
+        cleanup()
+        resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks))
+      }
+      const onError = (error: unknown) => {
+        cleanup()
+        reject(error)
+      }
+      // `data`/`end` go to the platform's replay stream; `error` still goes to
+      // the original emitter.
+      const cleanup = () => {
+        incoming.off('data', onData)
+        incoming.off('end', onEnd)
+        incoming.off('error', onError)
+      }
+      incoming.on('data', onData)
+      incoming.on('end', onEnd)
+      incoming.on('error', onError)
+    }
+  ))
 }
 
 // When setEncoding() was called on the stream, chunks arrive as strings in
@@ -201,6 +245,18 @@ const newRequestFromIncoming = (
         start(controller) {
           controller.enqueue(incoming.rawBody)
           controller.close()
+        },
+      })
+    } else if (hasReboundBodySurface(incoming)) {
+      // Readable.toWeb(incoming) would see the disturbed original stream and
+      // deliver an empty body; serve the replayed body from the rebound surface.
+      init.body = new ReadableStream({
+        async start(controller) {
+          try {
+            enqueueBufferedBody(controller, await readBodyFromReboundSurface(incoming))
+          } catch (error) {
+            controller.error(error)
+          }
         },
       })
     } else if ((incoming as IncomingMessageWithWrapBodyStream)[wrapBodyStream]) {
@@ -433,6 +489,14 @@ const readBodyDirect = (request: Record<string | symbol, any>): Promise<Buffer> 
 
   const incoming = request[incomingKey] as IncomingMessage | Http2ServerRequest
   if (incoming.readableDidRead) {
+    if (hasReboundBodySurface(incoming)) {
+      const promise = readBodyFromReboundSurface(incoming).then((buffer) => {
+        request[bodyBufferKey] = buffer
+        return buffer
+      })
+      request[bodyReadPromiseKey] = promise
+      return promise
+    }
     return rejectBodyUnusable()
   }
 
