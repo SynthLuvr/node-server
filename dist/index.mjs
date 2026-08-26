@@ -309,11 +309,26 @@ const bodyReadPromiseKey = Symbol("bodyReadPromise");
 const bodyConsumedDirectlyKey = Symbol("bodyConsumedDirectly");
 const bodyLockReaderKey = Symbol("bodyLockReader");
 const abortReasonKey = Symbol("abortReason");
+const bodySharedBufferKey = Symbol("bodySharedBuffer");
+const bodySharedStreamsKey = Symbol("bodySharedStreams");
+const bodyReleasedKey = Symbol("bodyReleased");
+const releaseSharedBody = Symbol("releaseSharedBody");
 const newBodyUnusableError = () => {
 	return /* @__PURE__ */ new TypeError("Body is unusable");
 };
 const rejectBodyUnusable = () => {
 	return Promise.reject(newBodyUnusableError());
+};
+const createBufferReplayStream = (bufferPromise, streams) => {
+	const stream = new ReadableStream({ async start(controller) {
+		try {
+			enqueueBufferedBody(controller, await bufferPromise);
+		} catch (error) {
+			controller.error(error);
+		}
+	} });
+	streams.add(stream);
+	return stream;
 };
 const textDecoder = new TextDecoder();
 const consumeBodyDirectOnce = (request) => {
@@ -469,6 +484,26 @@ const readBodyDirect = (request) => {
 	request[bodyReadPromiseKey] = promise;
 	return promise;
 };
+const shareBodyBufferOnce = (request) => {
+	if (!request[bodySharedBufferKey]) {
+		const raw = readRawBodyIfAvailable(request);
+		request[bodySharedBufferKey] = raw ? Promise.resolve(raw) : readBodyDirect(request);
+	}
+	const bufferPromise = request[bodySharedBufferKey];
+	bufferPromise.then((buffer) => {
+		if (!request[bodyReleasedKey]) request[bodyBufferKey] ||= buffer;
+	}, () => {});
+	return bufferPromise;
+};
+const newReplayRequest = (request, method, bufferPromise) => {
+	const replayStreams = request[bodySharedStreamsKey] ??= /* @__PURE__ */ new Set();
+	return new Request$1(request[urlKey], {
+		method,
+		headers: request.headers,
+		signal: request[getAbortController]().signal,
+		body: createBufferReplayStream(bufferPromise, replayStreams)
+	});
+};
 const requestPrototype = {
 	get method() {
 		return this[methodKey];
@@ -488,6 +523,13 @@ const requestPrototype = {
 		this[abortControllerKey] ||= new AbortController();
 		if (this[abortReasonKey] !== void 0 && !this[abortControllerKey].signal.aborted) this[abortControllerKey].abort(this[abortReasonKey]);
 		return this[abortControllerKey];
+	},
+	[releaseSharedBody]() {
+		this[bodyReleasedKey] = true;
+		for (const stream of this[bodySharedStreamsKey] ?? []) if (!stream.locked) stream.cancel().catch(() => {});
+		this[bodySharedStreamsKey] = void 0;
+		this[bodySharedBufferKey] = void 0;
+		this[bodyBufferKey] = void 0;
 	},
 	[getRequestCache]() {
 		const abortController = this[getAbortController]();
@@ -512,6 +554,7 @@ const requestPrototype = {
 			} });
 			return this[requestCache] = req;
 		}
+		if (this[bodySharedBufferKey]) return this[requestCache] = newReplayRequest(this, method, this[bodySharedBufferKey]);
 		return this[requestCache] = newRequestFromIncoming(this.method, this[urlKey], this.headers, this[incomingKey], abortController);
 	},
 	get body() {
@@ -544,15 +587,17 @@ Object.defineProperty(requestPrototype, "signal", { get() {
 		return this[getRequestCache]()[k];
 	} });
 });
-["clone", "formData"].forEach((k) => {
-	Object.defineProperty(requestPrototype, k, { value: function() {
-		if (this[bodyConsumedDirectlyKey]) {
-			if (k === "clone") throw newBodyUnusableError();
-			return rejectBodyUnusable();
-		}
-		return this[getRequestCache]()[k]();
-	} });
-});
+Object.defineProperty(requestPrototype, "formData", { value: function() {
+	if (this[bodyConsumedDirectlyKey]) return rejectBodyUnusable();
+	return this[getRequestCache]().formData();
+} });
+Object.defineProperty(requestPrototype, "clone", { value: function() {
+	if (this[bodyConsumedDirectlyKey]) throw newBodyUnusableError();
+	const method = this.method;
+	if (method === "GET" || method === "HEAD" || method === "TRACE") return this[getRequestCache]().clone();
+	if (this[requestCache]) return this[requestCache].clone();
+	return newReplayRequest(this, method, shareBodyBufferOnce(this));
+} });
 Object.defineProperty(requestPrototype, "text", { value: function() {
 	return readBodyWithFastPath(this, "text", (buf) => textDecoder.decode(buf));
 } });
@@ -842,6 +887,7 @@ const drainIncoming = (incoming) => {
 	incoming.resume();
 };
 const makeCloseHandler = (req, incoming, outgoing, needsBodyCleanup) => () => {
+	req[releaseSharedBody]();
 	if (incoming.errored) {
 		recordBodyBufferedBeforeDisconnect(incoming);
 		req[abortRequest](incoming.errored.toString());
@@ -1025,6 +1071,9 @@ const getRequestListener = (fetchCallback, options = {}) => {
 				outgoing
 			});
 			if (!isPromise(res) && isImmediateCacheableResponse(res)) {
+				if (req[bodySharedBufferKey]) outgoing.once("close", () => {
+					req[releaseSharedBody]();
+				});
 				if (needsBodyCleanup && !incoming.readableEnded) outgoing.once("finish", () => {
 					if (!incoming.readableEnded) drainIncoming(incoming);
 				});
